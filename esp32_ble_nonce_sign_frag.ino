@@ -2,13 +2,20 @@
 #include <Preferences.h>
 #include <sodium.h>
 #include <string.h>
+#define MBEDTLS_ALLOW_PRIVATE_ACCESS
+#include <mbedtls/ecdsa.h>
+#include <mbedtls/sha256.h>
+#include <mbedtls/version.h>
+#include <esp_random.h>
 
 /*
-  BLE 分片廣播，協議版本 2。
+  BLE 分片廣播，協議版本 3。
 
   簽進去的內容（大端序）：
-    [1B flags] [4B counter] [1B challenge_len] [challenge] [32B nonce]
-  其後接 64B Ed25519 簽章。以上整段再切成 26 字節的數據幀廣播。
+    [1B flags] [1B alg] [4B counter] [1B challenge_len] [challenge] [32B nonce]
+  其後接 64B 簽章。Ed25519 直接簽這段內容。
+  ECDSA 簽的是這段內容的 SHA-256，簽章為 r||s 各 32 字節。
+  公鑰：Ed25519 為 32 字節；ECDSA 為 X||Y 共 64 字節。
 
   flags bit0 = 1：驗證方應拒絕不大於上次的計數器（防雙花）
   flags bit0 = 0：測試模式，驗證方可以不檢查計數器
@@ -26,7 +33,14 @@
 // 程式裡有寫就用程式裡的，不寫進晶片。留空 "" 才用晶片裡的；晶片裡也沒有，才在第一次開機產生並存入。
 // 晶片裡那組要換掉時，把 CLEAR_FLASH_SECRETS 改 true 上傳一次，完成後改回 false 再上傳。
 
+// 簽名算法，改這一行：1 = Ed25519，2 = ECDSA P-256，3 = ECDSA secp256k1
+static const uint8_t ALG_ED25519 = 1;
+static const uint8_t ALG_P256 = 2;
+static const uint8_t ALG_SECP256K1 = 3;
+static const uint8_t SIGN_ALG = ALG_ED25519;
+
 // 64 個十六進位字（32 字節）。留空 "" 表示用晶片裡的私鑰。下面是示例，正式環境請換掉或留空。
+// Ed25519 把它當種子。ECDSA 把它當私鑰純量，必須落在該曲線的合法範圍。
 static const char FIXED_SEED_HEX[] = "1032547698BADCFE0123456789ABCDEF55AA11EE22DD33CC44BB6699778800FF";
 
 // true 才在開機時從序列埠印出私鑰。預設關閉。
@@ -47,7 +61,7 @@ static const bool CHECK_COUNTER = true;
 static const uint8_t AD_TYPE_START  = 0xDD;
 static const uint8_t AD_TYPE_MIDDLE = 0xDE;
 static const uint8_t AD_TYPE_END    = 0xDF;
-static const uint8_t PROTO_VERSION  = 2;
+static const uint8_t PROTO_VERSION  = 3;
 static const uint8_t FLAG_CHECK_COUNTER = 0x01;
 
 static const size_t NONCE_SIZE = 32;
@@ -88,13 +102,17 @@ static uint8_t challenge[MAX_CHALLENGE_LEN];
 static uint8_t challengeLen = 0;
 static uint8_t flagsByte = 0;
 
-static uint8_t body[1 + 4 + 1 + MAX_CHALLENGE_LEN + NONCE_SIZE + SIG_SIZE];
+static uint8_t body[1 + 1 + 4 + 1 + MAX_CHALLENGE_LEN + NONCE_SIZE + SIG_SIZE];
 static uint16_t bodyLen = 0;
 static bool payloadReady = false;
 
-static uint8_t sk[crypto_sign_SECRETKEYBYTES];
-static uint8_t pk[crypto_sign_PUBLICKEYBYTES];
+static uint8_t sk[64];
+static uint8_t pk[64];
+static size_t skLen = 0;
+static size_t pkLen = 0;
 static bool keyLoaded = false;
+static mbedtls_ecdsa_context ecCtx;
+static bool ecInited = false;
 
 static uint32_t counterNext = 1;
 static uint32_t counterLimit = 1;
@@ -130,7 +148,7 @@ bool isPrintableText(const uint8_t* data, size_t len) {
 
 void printStatus() {
   Serial.print("[PUB] ");
-  printHex(pk, crypto_sign_PUBLICKEYBYTES);
+  printHex(pk, pkLen);
   Serial.println();
 
   Serial.print("[CHAL] ");
@@ -150,7 +168,9 @@ void printStatus() {
   Serial.print(" key=");
   Serial.print(keyFromCode ? "code" : "flash");
   Serial.print(" chal=");
-  Serial.println(challengeFromCode ? "code" : "flash");
+  Serial.print(challengeFromCode ? "code" : "flash");
+  Serial.print(" alg=");
+  Serial.println(SIGN_ALG);
 }
 
 bool reserveCounter(uint32_t start) {
@@ -271,58 +291,220 @@ void loadChallenge() {
   Serial.println("[CHAL] Generated challenge and stored to flash");
 }
 
+int espRng(void* ctx, unsigned char* buf, size_t len) {
+  (void)ctx;
+  esp_fill_random(buf, len);
+  return 0;
+}
+
+bool sha256Bytes(const uint8_t* msg, size_t msgLen, uint8_t out[32]) {
+  mbedtls_sha256_context sha;
+  mbedtls_sha256_init(&sha);
+#if MBEDTLS_VERSION_NUMBER >= 0x03000000
+  int rc = mbedtls_sha256_starts(&sha, 0);
+  if (rc == 0) rc = mbedtls_sha256_update(&sha, msg, msgLen);
+  if (rc == 0) rc = mbedtls_sha256_finish(&sha, out);
+#else
+  int rc = mbedtls_sha256_starts_ret(&sha, 0);
+  if (rc == 0) rc = mbedtls_sha256_update_ret(&sha, msg, msgLen);
+  if (rc == 0) rc = mbedtls_sha256_finish_ret(&sha, out);
+#endif
+  mbedtls_sha256_free(&sha);
+  return rc == 0;
+}
+
+mbedtls_ecp_group_id ecGroupId() {
+  return SIGN_ALG == ALG_SECP256K1 ? MBEDTLS_ECP_DP_SECP256K1 : MBEDTLS_ECP_DP_SECP256R1;
+}
+
+const char* nvsScalarKey() {
+  return SIGN_ALG == ALG_SECP256K1 ? "dk1" : "d256";
+}
+
+const char* nvsPointKey() {
+  return SIGN_ALG == ALG_SECP256K1 ? "qk1" : "q256";
+}
+
+void resetEc() {
+  if (ecInited) mbedtls_ecdsa_free(&ecCtx);
+  mbedtls_ecdsa_init(&ecCtx);
+  ecInited = true;
+}
+
+bool exportEcPublic() {
+  if (mbedtls_mpi_write_binary(&ecCtx.Q.X, pk, 32) != 0) return false;
+  if (mbedtls_mpi_write_binary(&ecCtx.Q.Y, pk + 32, 32) != 0) return false;
+  pkLen = 64;
+  return true;
+}
+
+bool loadEcScalar(const uint8_t scalar[32]) {
+  resetEc();
+  if (mbedtls_ecp_group_load(&ecCtx.grp, ecGroupId()) != 0) return false;
+  if (mbedtls_mpi_read_binary(&ecCtx.d, scalar, 32) != 0) return false;
+  if (mbedtls_ecp_check_privkey(&ecCtx.grp, &ecCtx.d) != 0) return false;
+  if (mbedtls_ecp_mul(&ecCtx.grp, &ecCtx.Q, &ecCtx.d, &ecCtx.grp.G, espRng, nullptr) != 0) return false;
+  memcpy(sk, scalar, 32);
+  skLen = 32;
+  return exportEcPublic();
+}
+
+bool generateEcKey() {
+  resetEc();
+  if (mbedtls_ecdsa_genkey(&ecCtx, ecGroupId(), espRng, nullptr) != 0) return false;
+  if (mbedtls_mpi_write_binary(&ecCtx.d, sk, 32) != 0) return false;
+  skLen = 32;
+  return exportEcPublic();
+}
+
+bool signPayload(const uint8_t* msg, size_t msgLen) {
+  if (SIGN_ALG == ALG_ED25519) {
+    unsigned long long sigLen = 0;
+    if (crypto_sign_detached(sigBuf, &sigLen, msg, msgLen, sk) != 0 || sigLen != SIG_SIZE) {
+      Serial.println("[ERROR] crypto_sign_detached failed");
+      return false;
+    }
+    return true;
+  }
+
+  uint8_t hash[32];
+  if (!sha256Bytes(msg, msgLen, hash)) {
+    Serial.println("[ERROR] sha256 failed");
+    return false;
+  }
+  mbedtls_mpi r;
+  mbedtls_mpi s;
+  mbedtls_mpi_init(&r);
+  mbedtls_mpi_init(&s);
+  int rc = mbedtls_ecdsa_sign(&ecCtx.grp, &r, &s, &ecCtx.d, hash, sizeof(hash), espRng, nullptr);
+  if (rc == 0) {
+    if (mbedtls_mpi_write_binary(&r, sigBuf, 32) != 0 || mbedtls_mpi_write_binary(&s, sigBuf + 32, 32) != 0) {
+      rc = -1;
+    }
+  }
+  mbedtls_mpi_free(&r);
+  mbedtls_mpi_free(&s);
+  if (rc != 0) {
+    Serial.println("[ERROR] ecdsa sign failed");
+    return false;
+  }
+  return true;
+}
+
 void ensureKeys() {
   keyFromCode = false;
+  keyLoaded = false;
+  pkLen = 0;
+  skLen = 0;
   if (sodium_init() == -1) {
     Serial.println("[ERROR] sodium_init failed");
     return;
   }
+  if (SIGN_ALG != ALG_ED25519 && SIGN_ALG != ALG_P256 && SIGN_ALG != ALG_SECP256K1) {
+    Serial.println("[ERROR] SIGN_ALG must be 1, 2, or 3");
+    return;
+  }
 
+  uint8_t seed[32];
+  bool haveSeed = false;
   if (FIXED_SEED_HEX[0] != '\0') {
-    uint8_t seed[crypto_sign_SEEDBYTES];
     if (!parseSeedHex(FIXED_SEED_HEX, seed)) {
       Serial.println("[ERROR] FIXED_SEED_HEX must be empty or 64 hex characters");
       return;
     }
-    if (crypto_sign_seed_keypair(pk, sk, seed) != 0) {
-      Serial.println("[ERROR] crypto_sign_seed_keypair failed");
+    haveSeed = true;
+  }
+
+  if (SIGN_ALG == ALG_ED25519) {
+    if (haveSeed) {
+      if (crypto_sign_seed_keypair(pk, sk, seed) != 0) {
+        Serial.println("[ERROR] crypto_sign_seed_keypair failed");
+        return;
+      }
+      pkLen = crypto_sign_PUBLICKEYBYTES;
+      skLen = crypto_sign_SECRETKEYBYTES;
+      keyLoaded = true;
+      keyFromCode = true;
+      Serial.println("[KEY] Using Ed25519 private key from code");
+    } else {
+      prefs.begin(NVS_NAMESPACE, false);
+      size_t haveSk = prefs.getBytesLength(NVS_KEY_SK);
+      size_t havePk = prefs.getBytesLength(NVS_KEY_PK);
+      if (haveSk == crypto_sign_SECRETKEYBYTES && havePk == crypto_sign_PUBLICKEYBYTES) {
+        prefs.getBytes(NVS_KEY_SK, sk, crypto_sign_SECRETKEYBYTES);
+        prefs.getBytes(NVS_KEY_PK, pk, crypto_sign_PUBLICKEYBYTES);
+        prefs.end();
+        pkLen = crypto_sign_PUBLICKEYBYTES;
+        skLen = crypto_sign_SECRETKEYBYTES;
+        keyLoaded = true;
+        Serial.println("[KEY] Loaded Ed25519 private key from flash");
+      } else {
+        if (crypto_sign_keypair(pk, sk) != 0) {
+          prefs.end();
+          Serial.println("[ERROR] keypair generation failed");
+          return;
+        }
+        size_t wroteSk = prefs.putBytes(NVS_KEY_SK, sk, crypto_sign_SECRETKEYBYTES);
+        size_t wrotePk = prefs.putBytes(NVS_KEY_PK, pk, crypto_sign_PUBLICKEYBYTES);
+        prefs.end();
+        if (wroteSk != crypto_sign_SECRETKEYBYTES || wrotePk != crypto_sign_PUBLICKEYBYTES) {
+          Serial.println("[ERROR] key flash write failed");
+          return;
+        }
+        pkLen = crypto_sign_PUBLICKEYBYTES;
+        skLen = crypto_sign_SECRETKEYBYTES;
+        keyLoaded = true;
+        Serial.println("[KEY] Generated Ed25519 private key and stored to flash");
+      }
+    }
+  } else if (haveSeed) {
+    if (!loadEcScalar(seed)) {
+      Serial.println("[ERROR] ECDSA private scalar rejected");
       return;
     }
     keyLoaded = true;
     keyFromCode = true;
-    Serial.println("[KEY] Using private key from code");
+    Serial.println("[KEY] Using ECDSA private key from code");
   } else {
+    const char* scalarKey = nvsScalarKey();
+    const char* pointKey = nvsPointKey();
     prefs.begin(NVS_NAMESPACE, false);
-    size_t haveSk = prefs.getBytesLength(NVS_KEY_SK);
-    size_t havePk = prefs.getBytesLength(NVS_KEY_PK);
-    if (haveSk == crypto_sign_SECRETKEYBYTES && havePk == crypto_sign_PUBLICKEYBYTES) {
-      prefs.getBytes(NVS_KEY_SK, sk, crypto_sign_SECRETKEYBYTES);
-      prefs.getBytes(NVS_KEY_PK, pk, crypto_sign_PUBLICKEYBYTES);
+    size_t haveSk = prefs.getBytesLength(scalarKey);
+    size_t havePk = prefs.getBytesLength(pointKey);
+    if (haveSk == 32 && havePk == 64) {
+      uint8_t scalar[32];
+      prefs.getBytes(scalarKey, scalar, 32);
       prefs.end();
+      if (!loadEcScalar(scalar)) {
+        Serial.println("[ERROR] stored ECDSA key rejected");
+        return;
+      }
       keyLoaded = true;
-      Serial.println("[KEY] Loaded private key from flash");
+      Serial.println("[KEY] Loaded ECDSA private key from flash");
     } else {
-      if (crypto_sign_keypair(pk, sk) != 0) {
-        prefs.end();
-        Serial.println("[ERROR] keypair generation failed");
+      prefs.end();
+      if (!generateEcKey()) {
+        Serial.println("[ERROR] ECDSA key generation failed");
         return;
       }
-      size_t wroteSk = prefs.putBytes(NVS_KEY_SK, sk, crypto_sign_SECRETKEYBYTES);
-      size_t wrotePk = prefs.putBytes(NVS_KEY_PK, pk, crypto_sign_PUBLICKEYBYTES);
+      prefs.begin(NVS_NAMESPACE, false);
+      size_t wroteSk = prefs.putBytes(scalarKey, sk, 32);
+      size_t wrotePk = prefs.putBytes(pointKey, pk, 64);
       prefs.end();
-      if (wroteSk != crypto_sign_SECRETKEYBYTES || wrotePk != crypto_sign_PUBLICKEYBYTES) {
-        Serial.println("[ERROR] key flash write failed");
+      if (wroteSk != 32 || wrotePk != 64) {
+        Serial.println("[ERROR] ECDSA key flash write failed");
+        keyLoaded = false;
         return;
       }
       keyLoaded = true;
-      Serial.println("[KEY] Generated private key and stored to flash");
+      Serial.println("[KEY] Generated ECDSA private key and stored to flash");
     }
   }
 
-  if (PRINT_PRIVATE_KEY) {
+  if (PRINT_PRIVATE_KEY && keyLoaded) {
     Serial.println("[WARN] private key follows; disable PRINT_PRIVATE_KEY after debugging");
     Serial.print("[PRIV] ");
-    printHex(sk, crypto_sign_SECRETKEYBYTES);
+    printHex(sk, skLen);
     Serial.println();
   }
 }
@@ -349,9 +531,10 @@ void preparePayload() {
   }
   randombytes_buf(nonceBuf, NONCE_SIZE);
 
-  uint8_t msg[1 + 4 + 1 + MAX_CHALLENGE_LEN + NONCE_SIZE];
+  uint8_t msg[1 + 1 + 4 + 1 + MAX_CHALLENGE_LEN + NONCE_SIZE];
   size_t n = 0;
   msg[n++] = flagsByte;
+  msg[n++] = SIGN_ALG;
   msg[n++] = (uint8_t)((ctr >> 24) & 0xFF);
   msg[n++] = (uint8_t)((ctr >> 16) & 0xFF);
   msg[n++] = (uint8_t)((ctr >> 8) & 0xFF);
@@ -362,11 +545,7 @@ void preparePayload() {
   memcpy(msg + n, nonceBuf, NONCE_SIZE);
   n += NONCE_SIZE;
 
-  unsigned long long sigLen = 0;
-  if (crypto_sign_detached(sigBuf, &sigLen, msg, n, sk) != 0 || sigLen != SIG_SIZE) {
-    Serial.println("[ERROR] crypto_sign_detached failed");
-    return;
-  }
+  if (!signPayload(msg, n)) return;
 
   memcpy(body, msg, n);
   memcpy(body + n, sigBuf, SIG_SIZE);
@@ -437,6 +616,7 @@ void sendFrame(uint8_t frameIdx) {
     meta[3] = PROTO_VERSION;
     meta[4] = flagsByte;
     meta[5] = challengeLen;
+    meta[6] = SIGN_ALG;
     sendAdv(AD_TYPE_START, seq, meta, ANNOUNCE_DATA_SIZE);
     return;
   }

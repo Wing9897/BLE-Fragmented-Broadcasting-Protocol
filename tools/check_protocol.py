@@ -1,12 +1,25 @@
-"""Check the v2 broadcaster's signature layout, counter, and framing.
+"""Check the v3 broadcaster's signature layout, counter, and framing.
 
 Mirrors esp32_ble_nonce_sign_frag.ino. Does not exercise BLE or flash.
+ECDSA cases check the SHA-256 then r||s layout with the Python ecdsa package.
 """
+
+import hashlib
 
 from nacl.signing import SigningKey
 
+try:
+    from ecdsa import NIST256p, SECP256k1, SigningKey as EcSigningKey
+    from ecdsa.util import sigdecode_string, sigencode_string
+except ImportError:
+    NIST256p = SECP256k1 = EcSigningKey = None
+    sigdecode_string = sigencode_string = None
+
 AD_START, AD_MIDDLE, AD_END = 0xDD, 0xDE, 0xDF
-PROTO_VERSION = 2
+PROTO_VERSION = 3
+ALG_ED25519 = 1
+ALG_P256 = 2
+ALG_SECP256K1 = 3
 FLAG_CHECK_COUNTER = 0x01
 NONCE_SIZE = 32
 SIG_SIZE = 64
@@ -34,17 +47,30 @@ def parse_seed_hex(hex_text: str) -> bytes:
     return bytes.fromhex(hex_text)
 
 
-def build_body(counter: int, challenge: bytes, nonce: bytes, seed: bytes, check: bool) -> bytes:
+def signed_message(counter: int, challenge: bytes, nonce: bytes, check: bool, alg: int) -> bytes:
     flags = FLAG_CHECK_COUNTER if check else 0
-    message = bytes([
+    return bytes([
         flags,
+        alg,
         (counter >> 24) & 0xFF,
         (counter >> 16) & 0xFF,
         (counter >> 8) & 0xFF,
         counter & 0xFF,
         len(challenge),
     ]) + challenge + nonce
-    signature = SigningKey(seed).sign(message).signature
+
+
+def build_body(counter: int, challenge: bytes, nonce: bytes, seed: bytes, check: bool, alg: int = ALG_ED25519) -> bytes:
+    message = signed_message(counter, challenge, nonce, check, alg)
+    if alg == ALG_ED25519:
+        signature = SigningKey(seed).sign(message).signature
+    else:
+        if EcSigningKey is None:
+            raise AssertionError("python ecdsa package is missing")
+        curve = NIST256p if alg == ALG_P256 else SECP256k1
+        key = EcSigningKey.from_string(seed, curve=curve, hashfunc=hashlib.sha256)
+        signature = key.sign_digest(hashlib.sha256(message).digest(), sigencode=sigencode_string)
+        key.get_verifying_key().verify_digest(signature, hashlib.sha256(message).digest(), sigdecode=sigdecode_string)
     if len(signature) != SIG_SIZE:
         raise AssertionError("signature length")
     return message + signature
@@ -73,7 +99,7 @@ def build_adv(ad_type: int, seq: int, data: bytes) -> bytes:
     return raw
 
 
-def fragment(body: bytes, global_seq: int, flags: int, challenge_len: int) -> tuple[list[bytes], int]:
+def fragment(body: bytes, global_seq: int, flags: int, challenge_len: int, alg: int = ALG_ED25519) -> tuple[list[bytes], int]:
     chunks = chunk_count(len(body))
     total = 1 + chunks
     base, next_seq = assign_base(global_seq, total)
@@ -84,6 +110,7 @@ def fragment(body: bytes, global_seq: int, flags: int, challenge_len: int) -> tu
     meta[3] = PROTO_VERSION
     meta[4] = flags
     meta[5] = challenge_len
+    meta[6] = alg
     frames = [build_adv(AD_START, base, bytes(meta))]
     for index in range(chunks):
         offset = index * DATA_FRAME_SIZE
@@ -131,7 +158,7 @@ def test_seed_and_signature() -> None:
     nonce = bytes(range(32))
     body = build_body(1, challenge, nonce, seed, True)
     message, signature = body[:-SIG_SIZE], body[-SIG_SIZE:]
-    if message != bytes([FLAG_CHECK_COUNTER, 0, 0, 0, 1, 4]) + challenge + nonce:
+    if message != bytes([FLAG_CHECK_COUNTER, ALG_ED25519, 0, 0, 0, 1, 4]) + challenge + nonce:
         raise AssertionError("signed layout")
     SigningKey(seed).verify_key.verify(message, signature)
     try:
@@ -148,7 +175,7 @@ def test_default_fragment() -> None:
     nonce = bytes([0x11]) * 32
     body = build_body(1, challenge, nonce, seed, True)
     frames, next_seq = fragment(body, 0, FLAG_CHECK_COUNTER, len(challenge))
-    if len(body) != 106 or len(frames) != 6 or next_seq != 6:
+    if len(body) != 107 or len(frames) != 6 or next_seq != 6:
         raise AssertionError((len(body), len(frames), next_seq))
     if frames[0][1] != AD_START or frames[-1][1] != AD_END:
         raise AssertionError("frame types")
@@ -160,9 +187,9 @@ def test_default_fragment() -> None:
             raise AssertionError("over 31")
     announce = frames[0]
     body_len = (announce[4] << 8) | announce[5]
-    if body_len != 106 or announce[6] != 5 or announce[7] != PROTO_VERSION:
+    if body_len != 107 or announce[6] != 5 or announce[7] != PROTO_VERSION:
         raise AssertionError("announce meta")
-    if announce[8] != FLAG_CHECK_COUNTER or announce[9] != 4:
+    if announce[8] != FLAG_CHECK_COUNTER or announce[9] != 4 or announce[10] != ALG_ED25519:
         raise AssertionError("announce flags")
     if reassemble(frames) != body:
         raise AssertionError("reassembly")
@@ -233,7 +260,7 @@ def take_unchecked() -> int:
 def test_unchecked_flag() -> None:
     seed = parse_seed_hex(EXAMPLE_SEED_HEX)
     body = build_body(0, b"test", b"\x22" * 32, seed, False)
-    if body[0] != 0 or body[1:5] != b"\x00\x00\x00\x00":
+    if body[0] != 0 or body[1] != ALG_ED25519 or body[2:6] != b"\x00\x00\x00\x00":
         raise AssertionError("unchecked counter layout")
 
 
@@ -242,12 +269,24 @@ def test_max_challenge_fits() -> None:
     challenge = b"x" * 32
     body = build_body(2, challenge, b"\x33" * 32, seed, True)
     frames, _ = fragment(body, 0, FLAG_CHECK_COUNTER, 32)
-    if len(body) != 134 or len(frames) != 7:
+    if len(body) != 135 or len(frames) != 7:
         raise AssertionError((len(body), len(frames)))
     for frame in frames:
         check_crc(frame)
     if reassemble(frames) != body:
         raise AssertionError("max challenge reassembly")
+
+
+def test_ecdsa_layouts() -> None:
+    seed = parse_seed_hex(EXAMPLE_SEED_HEX)
+    nonce = b"\x44" * 32
+    for alg in (ALG_P256, ALG_SECP256K1):
+        body = build_body(3, b"test", nonce, seed, True, alg)
+        if body[1] != alg or len(body) != 107:
+            raise AssertionError((alg, len(body)))
+        frames, _ = fragment(body, 0, FLAG_CHECK_COUNTER, 4, alg)
+        if reassemble(frames) != body or frames[0][10] != alg:
+            raise AssertionError("ecdsa framing")
 
 
 def main() -> None:
@@ -258,11 +297,12 @@ def main() -> None:
     test_counter_blocks()
     test_unchecked_flag()
     test_max_challenge_fits()
+    test_ecdsa_layouts()
     print("ok")
-    print("default body 106 bytes, 6 frames, seq 0-5")
+    print("default body 107 bytes, 6 frames, seq 0-5, alg Ed25519")
+    print("P-256 and secp256k1 sign SHA-256(message) as 64-byte r||s")
     print("seq 250-255 carries into 256 on the next packet")
     print("counter 1..8192 then reboot continues at 8193")
-    print("signature covers flags, counter, challenge, nonce")
 
 
 if __name__ == "__main__":
